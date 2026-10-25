@@ -8,16 +8,20 @@ export type ByteStep = {
   syndrome: number;
   correction: number | null;
   correctedBit: number | null;
+  doubleErrorDetected: boolean;
 };
+
+export type ErrorMode = 'none' | 'single' | 'double';
 
 export type Simulation = {
   plaintext: string;
   plainBytes: number[];
   cipherBytes: number[];
+  keystreamBytes: number[];
   steps: ByteStep[];
   receivedBytes: number[];
   recovered: string;
-  injected: { byteIndex: number; bitIndex: number } | null;
+  injected: { byteIndex: number; bitIndices: number[] } | null;
 };
 
 const KEY = new Uint8Array([
@@ -98,6 +102,7 @@ function decodeHamming(received: number[]) {
   const overallMismatch = bits.reduce((acc, bit) => acc ^ bit, 0);
   let correctedBit: number | null = null;
   let correction: number | null = null;
+  const doubleErrorDetected = syndrome !== 0 && !overallMismatch;
   if (overallMismatch && syndrome > 0 && syndrome <= 12) {
     correctedBit = syndrome - 1;
     bits[correctedBit] ^= 1;
@@ -109,24 +114,44 @@ function decodeHamming(received: number[]) {
   }
   let byte = 0;
   [2, 4, 5, 6, 8, 9, 10, 11].forEach((position, bit) => { byte |= bits[position] << bit; });
-  return { bits, syndrome, correction, correctedBit, byte };
+  return { bits, syndrome, correction, correctedBit, byte, doubleErrorDetected };
 }
 
-export function runSimulation(message: string, inject: boolean, requestedBit: number): Simulation {
+export function runSimulation(
+  message: string,
+  errorMode: ErrorMode,
+  requestedByteIndex: number,
+  requestedBit: number,
+  requestedSecondBit: number,
+): Simulation {
   const plainBytes = Array.from(new TextEncoder().encode(message));
   const stream = keystream(plainBytes.length);
   const cipherBytes = plainBytes.map((byte, i) => byte ^ stream[i]);
+  const dataPositions = [2, 4, 5, 6, 8, 9, 10, 11];
+  const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
   let injected: Simulation['injected'] = null;
-  if (inject && cipherBytes.length) injected = { byteIndex: 0, bitIndex: Math.max(0, Math.min(12, requestedBit)) };
+  if (errorMode !== 'none' && cipherBytes.length) {
+    const byteIndex = clamp(requestedByteIndex, 0, cipherBytes.length - 1);
+    if (errorMode === 'double') {
+      const first = clamp(requestedBit, 0, dataPositions.length - 1);
+      let second = clamp(requestedSecondBit, 0, dataPositions.length - 1);
+      if (second === first) second = (second + 1) % dataPositions.length;
+      injected = { byteIndex, bitIndices: [dataPositions[first], dataPositions[second]] };
+    } else {
+      injected = { byteIndex, bitIndices: [clamp(requestedBit, 0, 12)] };
+    }
+  }
   const steps = cipherBytes.map((cipherByte, index) => {
     const encoded = encodeHamming(cipherByte);
     const received = [...encoded];
-    if (injected && injected.byteIndex === index) received[injected.bitIndex] ^= 1;
+    if (injected && injected.byteIndex === index) {
+      for (const bitIndex of injected.bitIndices) received[bitIndex] ^= 1;
+    }
     const decoded = decodeHamming(received);
     return {
       index, sourceByte: plainBytes[index], cipherByte, encoded, received,
       corrected: decoded.bits, syndrome: decoded.syndrome, correction: decoded.correction,
-      correctedBit: decoded.correctedBit,
+      correctedBit: decoded.correctedBit, doubleErrorDetected: decoded.doubleErrorDetected,
     };
   });
   const receivedBytes = steps.map((step) => {
@@ -135,7 +160,10 @@ export function runSimulation(message: string, inject: boolean, requestedBit: nu
   });
   const recoveredBytes = receivedBytes.map((byte, i) => byte ^ stream[i]);
   const recovered = new TextDecoder().decode(new Uint8Array(recoveredBytes));
-  return { plaintext: message, plainBytes, cipherBytes, steps, receivedBytes, recovered, injected };
+  return {
+    plaintext: message, plainBytes, cipherBytes, keystreamBytes: Array.from(stream),
+    steps, receivedBytes, recovered, injected,
+  };
 }
 
 export const bytesHex = (bytes: number[]) => bytes.length ? bytes.map((value) => value.toString(16).padStart(2, '0')).join(' ') : '—';

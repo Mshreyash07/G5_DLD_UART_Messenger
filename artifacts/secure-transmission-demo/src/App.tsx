@@ -24,7 +24,7 @@ import {
   useHealthCheck,
   useListHdlModules,
 } from '@workspace/api-client-react';
-import { bytesBinary, bytesHex, runSimulation, type Simulation } from '@/lib/simulator';
+import { bytesBinary, bytesHex, runSimulation, type ErrorMode, type Simulation } from '@/lib/simulator';
 import {
   Route,
   Switch,
@@ -33,17 +33,95 @@ import {
 } from 'wouter';
 
 const queryClient = new QueryClient();
+const dataCodewordPositions = [2, 4, 5, 6, 8, 9, 10, 11];
+const moduleWalkthroughs: Record<string, string[]> = {
+  secure_uart_top: [
+    'This is the system coordinator. Its transmit state machine accepts a message, builds the packet header, and tracks how many payload bytes remain.',
+    'Payload bytes pass through the ChaCha20 encryptor and Hamming encoder/packetizer before entering the transmit FIFO and UART transmitter.',
+    'On receive, UART bytes are assembled into a packet, the Hamming codeword is rebuilt and decoded, and valid ciphertext is passed to the decryptor.',
+    'Ready/valid signals coordinate transfers between blocks; status outputs report completion, packet errors, and corrected single-bit errors.',
+  ],
+  chacha20_encrypt: [
+    'The wrapper starts the keystream core with the supplied key, nonce, and initial counter.',
+    'When input data and a keystream byte are both ready, it XORs the two bytes. XOR with the same stream reverses the operation during decryption.',
+    'The ready/valid handshake holds output steady until the next block accepts it, and the last-byte marker follows the payload.',
+    'The core reports busy and counter exhaustion so a caller can avoid starting or consuming an invalid stream.',
+  ],
+  chacha20_keystream: [
+    'The module stores the key, nonce, and block counter, then forms the 16-word ChaCha20 initial state.',
+    'Quarter-round operations mix four 32-bit words using addition, XOR, and rotation. Ten column/diagonal double rounds produce the 20-round block.',
+    'The transformed state is added to the initial state and exposed as a 64-byte keystream block.',
+    'A byte index advances only when the consumer takes a byte; the block counter advances when another block is needed.',
+  ],
+  hamming_encoder: [
+    'The input byte is placed into the eight data positions of a 13-bit codeword; positions 1, 2, 4, and 8 (one-based) are reserved for Hamming parity.',
+    'Each parity bit is the XOR of the codeword positions covered by that parity check.',
+    'The final bit is overall parity across the first twelve bits. Together, the syndrome and overall parity support single-error correction and double-error detection.',
+    'The output is combinational: it represents the encoded input byte without a clocked transfer state.',
+  ],
+  hamming_packetizer: [
+    'When start is accepted, the 13-bit codeword is saved so it remains stable while the receiver is busy.',
+    'A small state machine sends the lower eight bits first, then the remaining five bits in a second byte.',
+    'Each byte stays valid until byte_ready acknowledges it; done pulses after the pair is accepted.',
+    'This framing makes a 13-bit protection word transportable over an 8-bit UART.',
+  ],
+  fifo: [
+    'The parameterized memory stores DATA_WIDTH-bit entries up to DEPTH and uses separate circular read and write pointers.',
+    'The occupancy counter determines the full and empty flags, preventing reads from an empty queue and writes to a full queue.',
+    'A valid read/write pair updates both pointers in one clock and leaves the count unchanged; single operations increment or decrement it.',
+    'Reset clears the pointers, count, and output register so the queue starts empty.',
+  ],
+  baud_gen: [
+    'The parameters determine how many system-clock cycles make up one UART bit period.',
+    'A counter increments on each rising clock edge and resets when it reaches the period limit.',
+    'At that boundary, baud_tick pulses for one clock cycle to time UART transmit and receive operations.',
+    'Reset clears the counter and tick, giving the serial logic a known timing phase.',
+  ],
+  uart_tx: [
+    'The transmitter latches a byte when a start request is accepted and waits for baud ticks to control bit timing.',
+    'It drives a low start bit, then shifts out eight data bits least-significant bit first.',
+    'A high stop bit follows the data; the state machine then returns the line to idle and reports completion.',
+    'The busy and done signals let upstream logic know when it can submit the next byte.',
+  ],
+  uart_rx: [
+    'Two synchronizer registers reduce the chance that an asynchronous serial input creates metastability in the system-clock logic.',
+    'The receiver waits for a low start edge, checks near the middle of the start bit, and then samples each data bit at baud intervals.',
+    'Eight sampled bits are assembled least-significant bit first; the stop-bit interval ends the frame and produces rx_done.',
+    'The state and counters track idle, start, data, and stop phases while rx_busy marks an active frame.',
+  ],
+  hamming_depacketizer: [
+    'The first incoming byte is saved while the module waits for the second byte of the protected word.',
+    'When the next valid byte arrives, the two pieces are joined back into a 13-bit codeword.',
+    'The upper unused bits of the second byte are checked; nonzero padding raises format_error.',
+    'codeword_valid indicates that the assembled word is ready for the Hamming decoder.',
+  ],
+  hamming_decoder: [
+    'Four parity checks are recomputed from the received codeword. Their results form a syndrome that points to a wrong Hamming position.',
+    'Overall parity distinguishes an odd number of flipped bits from an even number: a nonzero syndrome with odd overall parity identifies a single bit to invert.',
+    'An even-parity mismatch with a nonzero syndrome is reported as a double-bit error. The decoder flags it but does not correct the received bits.',
+    'In the uploaded RTL, data_out is only assigned from the codeword when no double-bit error is flagged; otherwise it stays at 0. The teaching simulator instead passes the uncorrected data through decryption to visibly demonstrate how corruption would look.',
+  ],
+  chacha20_decrypt: [
+    'Decryption uses the same ChaCha20 keystream inputs as encryption: key, nonce, and counter.',
+    'Each received ciphertext byte is XORed with its matching keystream byte to recover the plaintext byte.',
+    'Ready/valid flow control prevents consuming data when the keystream or output path is not ready.',
+    'The last-byte marker and busy/counter status are propagated to the surrounding receive pipeline.',
+  ],
+};
 
 function Home() {
   const [message, setMessage] = useState('Meet me at the lab at 09:30.');
-  const [injectError, setInjectError] = useState(false);
+  const [errorMode, setErrorMode] = useState<ErrorMode>('none');
+  const [errorByteIndex, setErrorByteIndex] = useState(0);
   const [bitIndex, setBitIndex] = useState(5);
+  const [secondBitIndex, setSecondBitIndex] = useState(6);
   const [simulation, setSimulation] = useState<Simulation | null>(null);
   const [selectedId, setSelectedId] = useState('');
   const health = useHealthCheck({ query: { queryKey: getHealthCheckQueryKey() } });
   const modulesQuery = useListHdlModules({ query: { queryKey: getListHdlModulesQueryKey() } });
   const modules = useMemo(() => modulesQuery.data ?? [], [modulesQuery.data]);
   const selectedModule = modules.find((module) => module.id === selectedId);
+  const messageByteCount = new TextEncoder().encode(message).length;
   const detailQuery = useGetHdlModule(selectedId, {
     query: { enabled: Boolean(selectedId), queryKey: getGetHdlModuleQueryKey(selectedId) },
   });
@@ -59,7 +137,7 @@ function Home() {
   function submitMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!message.trim()) return;
-    setSimulation(runSimulation(message, injectError, bitIndex));
+    setSimulation(runSimulation(message, errorMode, errorByteIndex, bitIndex, secondBitIndex));
   }
 
   function selectModule(id: string) {
@@ -83,6 +161,7 @@ function Home() {
 
   const activeHealth = health.data?.status?.toLowerCase() === 'ok' || health.data?.status?.toLowerCase() === 'healthy';
   const hasCorrection = simulation?.steps.some((step) => step.correction !== null) ?? false;
+  const hasUncorrectable = simulation?.steps.some((step) => step.doubleErrorDetected) ?? false;
 
   return (
     <div className="bench-shell">
@@ -101,7 +180,7 @@ function Home() {
         <div className="hero-row">
           <div>
             <div className="eyebrow">UART security bench <span style={{ color: '#b0aa9e' }}>— 01 / walkthrough</span></div>
-            <h1 className="hero-title">See what travels.<br /><span style={{ color: '#277261' }}>See what survives.</span></h1>
+            <h1 className="hero-title">CS203 Project Group 5<br /><span style={{ color: '#277261' }}>UART Messenger Simulator</span></h1>
             <p className="hero-copy">Send a message through the uploaded secure UART pipeline. Follow encryption, error-correction coding, a noisy wire, and recovery—one byte at a time.</p>
           </div>
           <div className="bench-tag" data-testid="text-model-label"><Activity size={13} style={{ display: 'inline', verticalAlign: '-2px', marginRight: 8 }} />LOCAL SOFTWARE MODEL · NOT CYCLE-ACCURATE</div>
@@ -120,15 +199,42 @@ function Home() {
           />
           <div className="send-controls">
             <div style={{ display: 'flex', alignItems: 'center', gap: 17, flexWrap: 'wrap' }}>
-              <label className="toggle-row" data-testid="control-bitflip">
-                <input type="checkbox" checked={injectError} onChange={(event) => setInjectError(event.target.checked)} data-testid="input-bitflip-toggle" />
-                Inject one bit flip
-              </label>
-              <label className="toggle-row" htmlFor="bit-choice">Codeword bit
-                <select id="bit-choice" className="select-input" value={bitIndex} onChange={(event) => setBitIndex(Number(event.target.value))} disabled={!injectError} data-testid="select-bit-index">
-                  {Array.from({ length: 13 }, (_, index) => <option value={index} key={index}>bit {index}{index === 12 ? ' · overall parity' : ''}</option>)}
-                </select>
-              </label>
+              <div className="error-controls" data-testid="control-bitflip">
+                <label className="error-control" htmlFor="error-mode">Channel noise
+                  <select id="error-mode" className="select-input" value={errorMode} onChange={(event) => setErrorMode(event.target.value as ErrorMode)} data-testid="select-error-mode">
+                    <option value="none">No error</option>
+                    <option value="single">Single-bit error</option>
+                    <option value="double">Two-bit error</option>
+                  </select>
+                </label>
+                <label className="error-control" htmlFor="error-byte">Byte
+                  <select id="error-byte" className="select-input" value={Math.min(errorByteIndex, Math.max(0, messageByteCount - 1))} onChange={(event) => setErrorByteIndex(Number(event.target.value))} disabled={errorMode === 'none' || messageByteCount === 0} data-testid="select-error-byte">
+                    {Array.from({ length: messageByteCount }, (_, index) => <option value={index} key={index}>byte {index + 1}</option>)}
+                  </select>
+                </label>
+                <label className="error-control" htmlFor="bit-choice">{errorMode === 'double' ? 'Data bit 1' : 'Codeword bit'}
+                  <select id="bit-choice" className="select-input" value={errorMode === 'double' ? Math.min(bitIndex, dataCodewordPositions.length - 1) : bitIndex} onChange={(event) => {
+                    const next = Number(event.target.value);
+                    setBitIndex(next);
+                    if (errorMode === 'double' && next === secondBitIndex) setSecondBitIndex((next + 1) % dataCodewordPositions.length);
+                  }} disabled={errorMode === 'none'} data-testid="select-bit-index">
+                    {(errorMode === 'double' ? dataCodewordPositions : Array.from({ length: 13 }, (_, index) => index)).map((index) => <option value={errorMode === 'double' ? dataCodewordPositions.indexOf(index) : index} key={index}>bit {index}{errorMode === 'double' ? ' · data' : index === 12 ? ' · overall parity' : ''}</option>)}
+                  </select>
+                </label>
+                {errorMode === 'double' && (
+                  <label className="error-control" htmlFor="second-bit-choice">Data bit 2
+                    <select id="second-bit-choice" className="select-input" value={secondBitIndex} onChange={(event) => {
+                      const next = Number(event.target.value);
+                      setSecondBitIndex(next === bitIndex ? (next + 1) % dataCodewordPositions.length : next);
+                    }} data-testid="select-second-bit-index">
+                      {dataCodewordPositions.map((index, dataBit) => <option value={dataBit} key={index}>bit {index} · data</option>)}
+                    </select>
+                  </label>
+                )}
+              </div>
+              <div className="error-control-note">{errorMode === 'double'
+                ? 'Two different data bits flip in the selected protected byte. The demo shows the uncorrected corrupted payload; the uploaded RTL instead holds decoder data_out at 0 when its double-error flag is set.'
+                : 'Bit flips apply to the selected protected byte. Choose any byte and any of its 13 Hamming codeword positions.'}</div>
             </div>
             <button className="btn-primary" type="submit" disabled={!message.trim()} data-testid="button-send">
               Transmit message <ArrowRight size={14} />
@@ -159,7 +265,7 @@ function Home() {
           <section className="panel result-card" data-testid="section-receiver">
             <div className="panel-head">
               <h2 className="panel-title">Receiver · decode & recover</h2>
-              <span className="panel-kicker">{simulation ? (hasCorrection ? 'single-bit error corrected' : 'message recovered') : 'awaiting transmission'}</span>
+              <span className="panel-kicker">{simulation ? (hasUncorrectable ? 'double-bit error detected · not corrected' : hasCorrection ? 'single-bit error corrected' : 'message recovered') : 'awaiting transmission'}</span>
             </div>
             <div className="result-content">
               {!simulation ? (
@@ -174,19 +280,23 @@ function Home() {
                     <div className="result-label"><span>Transmitted codewords · 13 bits / byte</span><span>{simulation.steps.length} bytes</span></div>
                     {simulation.steps.length ? simulation.steps.map((step) => (
                       <div key={step.index} style={{ marginBottom: 10 }}>
-                        <div className="result-label"><span>byte {step.index.toString().padStart(2, '0')} · 0x{step.cipherByte.toString(16).padStart(2, '0')}</span><span>{step.correction ? `syndrome ${step.syndrome} · corrected bit ${step.correctedBit}` : 'syndrome 0 · clean'}</span></div>
+                          <div className="result-label"><span>byte {step.index + 1} · 0x{step.cipherByte.toString(16).padStart(2, '0')}</span><span>{step.doubleErrorDetected ? `syndrome ${step.syndrome} · detected, not corrected` : step.correction ? `syndrome ${step.syndrome} · corrected bit ${step.correctedBit}` : 'syndrome 0 · clean'}</span></div>
                         <div className="bit-strip" data-testid={`bits-codeword-${step.index}`}>
-                          {step.encoded.map((bit, index) => <span key={index} className={`bit-cell ${simulation.injected?.byteIndex === step.index && simulation.injected.bitIndex === index ? 'flip' : ''}`} title={`codeword bit ${index}`} data-testid={`bit-sent-${step.index}-${index}`}>{bit}</span>)}
+                            {step.encoded.map((bit, index) => <span key={index} className={`bit-cell ${simulation.injected?.byteIndex === step.index && simulation.injected.bitIndices.includes(index) ? 'flip' : ''}`} title={`codeword bit ${index}`} data-testid={`bit-sent-${step.index}-${index}`}>{bit}</span>)}
                         </div>
                         {simulation.injected?.byteIndex === step.index && (
                           <>
-                            <div className="result-label" style={{ marginTop: 7 }}><span>Received after injected flip · bit {simulation.injected.bitIndex} inverted</span><span>corrected codeword below</span></div>
+                              <div className="result-label" style={{ marginTop: 7 }}><span>Received · bit{simulation.injected.bitIndices.length > 1 ? 's' : ''} {simulation.injected.bitIndices.join(' and ')} inverted</span><span>{step.doubleErrorDetected ? 'not corrected' : 'single-error correction'}</span></div>
                             <div className="bit-strip" data-testid={`bits-received-${step.index}`}>
-                              {step.received.map((bit, index) => <span key={index} className={`bit-cell ${index === simulation.injected?.bitIndex ? (step.correctedBit === index ? 'corrected' : 'flip') : ''}`} title={`received bit ${index}`} data-testid={`bit-received-${step.index}-${index}`}>{bit}</span>)}
+                                {step.received.map((bit, index) => <span key={index} className={`bit-cell ${simulation.injected?.bitIndices.includes(index) ? (step.doubleErrorDetected ? 'uncorrectable' : step.correctedBit === index ? 'corrected' : 'flip') : ''}`} title={`received bit ${index}`} data-testid={`bit-received-${step.index}-${index}`}>{bit}</span>)}
                             </div>
-                            <div style={{ fontSize: 10, color: '#24725c', marginTop: 6 }} data-testid={`text-correction-${step.index}`}>
-                              {step.correction ? <><Check size={12} style={{ display: 'inline', verticalAlign: '-2px', marginRight: 4 }} />Syndrome {step.syndrome} points to codeword position {step.correction}; corrected before decryption.</> : 'No correction was needed.'}
+                              <div className={`error-status ${step.doubleErrorDetected ? 'error-status-bad' : ''}`} data-testid={`text-correction-${step.index}`}>
+                                {step.doubleErrorDetected ? <>Syndrome {step.syndrome} plus even overall parity indicates a double-bit error. The decoder flags it but leaves the codeword unchanged.</> : step.correction ? <><Check size={12} style={{ display: 'inline', verticalAlign: '-2px', marginRight: 4 }} />Syndrome {step.syndrome} points to codeword position {step.correction}; corrected before decryption.</> : 'No correction was needed.'}
                             </div>
+                              <div className="result-label" style={{ marginTop: 9 }}><span>Codeword delivered by decoder</span><span>{step.doubleErrorDetected ? 'uncorrected data' : 'corrected data'}</span></div>
+                              <div className="bit-strip" data-testid={`bits-decoded-${step.index}`}>
+                                {step.corrected.map((bit, index) => <span key={index} className={`bit-cell ${step.correctedBit === index ? 'corrected' : step.doubleErrorDetected && simulation.injected?.bitIndices.includes(index) ? 'uncorrectable' : ''}`} title={`decoder output bit ${index}`}>{bit}</span>)}
+                              </div>
                           </>
                         )}
                       </div>
@@ -195,6 +305,7 @@ function Home() {
                   <div className="result-row">
                     <div className="result-label"><span>Recovered message</span><span>ChaCha20 decrypt</span></div>
                     <div className="value-box" data-testid="text-recovered">{simulation.recovered || '(empty message)'}</div>
+                    {hasUncorrectable && <div className="error-status error-status-bad" data-testid="text-uncorrectable-message">At least one two-bit error was detected but not corrected. This teaching model decrypts the altered data to show a corrupted message; the uploaded RTL instead outputs zero data for a codeword it flags as a double error.</div>}
                   </div>
                   <div className="result-row">
                     <div className="result-label"><span>Plaintext bytes at sender</span><span>{simulation.plainBytes.length} bytes</span></div>
@@ -226,7 +337,11 @@ function Home() {
                     <div className="result-label"><span>Encrypted payload · bits</span><span>ciphertext only</span></div>
                     <div className="value-box" data-testid="text-intercepted-bits">{bytesBinary(simulation.cipherBytes)}</div>
                   </div>
-                  <div className="privacy-note" data-testid="text-interceptor-privacy"><ShieldCheck size={13} style={{ display: 'inline', verticalAlign: '-3px', marginRight: 6 }} />This simulated wire view shows ciphertext only. The fixed demo key is bundled with the browser model for repeatable results; this is not a production secure-messaging app.</div>
+                  <div className="result-row">
+                    <div className="result-label"><span>ChaCha20 keystream · hex</span><span>simulator trace</span></div>
+                    <div className="value-box" data-testid="text-intercepted-keystream">{bytesHex(simulation.keystreamBytes)}</div>
+                  </div>
+                  <div className="privacy-note" data-testid="text-interceptor-privacy"><ShieldCheck size={13} style={{ display: 'inline', verticalAlign: '-3px', marginRight: 6 }} />The ciphertext is what crosses the modeled wire. The keystream shown here is an educational simulator trace, not information a passive wire listener can derive. The fixed demo key is bundled with the browser model for repeatable results; this is not production secure messaging.</div>
                 </>
               )}
             </div>
@@ -283,6 +398,11 @@ function Home() {
                   <div className="code-wrap" data-testid="code-module-source" aria-label={`Source code for ${detail.fileName}`}>
                     {detail.code.split('\n').map((line, index) => <div className="code-line" key={index}><span className="line-num">{index + 1}</span><span className="code-text">{line || ' '}</span></div>)}
                   </div>
+                  <section className="module-walkthrough" data-testid="section-module-walkthrough" aria-labelledby="module-walkthrough-heading">
+                    <h4 id="module-walkthrough-heading">How this file works</h4>
+                    <ol>{(moduleWalkthroughs[detail.id] ?? [detail.description]).map((item, index) => <li key={index}>{item}</li>)}</ol>
+                    <p>These notes explain the uploaded RTL at a functional level. The live message simulation above is a browser-side teaching model, not a cycle-accurate execution of this Verilog.</p>
+                  </section>
                 </>
               ) : <div className="source-empty" data-testid="empty-detail">No module details returned.</div>}
             </article>
