@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: hdl
+    description: Uploaded Verilog source modules
 paths:
   /healthz:
     get:
@@ -24,6 +26,42 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /hdl/modules:
+    get:
+      operationId: listHdlModules
+      tags: [hdl]
+      summary: List Verilog modules
+      description: Returns the uploaded Verilog modules with their pipeline roles and explanations.
+      responses:
+        "200":
+          description: Verilog modules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/HdlModule"
+  /hdl/modules/{id}:
+    get:
+      operationId: getHdlModule
+      tags: [hdl]
+      summary: Get a Verilog module
+      description: Returns a module's metadata and exact uploaded source code.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Verilog source
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HdlModuleDetail"
+        "404":
+          description: Module not found
 components:
   schemas:
     HealthStatus:
@@ -33,4 +71,34 @@ components:
           type: string
       required:
         - status
+    HdlModule:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        fileName:
+          type: string
+        stage:
+          type: string
+        description:
+          type: string
+      required: [id, title, fileName, stage, description]
+    HdlModuleDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        fileName:
+          type: string
+        stage:
+          type: string
+        description:
+          type: string
+        code:
+          type: string
+      required: [id, title, fileName, stage, description, code]
 

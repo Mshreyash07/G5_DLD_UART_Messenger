@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/secure-transmission-demo/"
+title = "Secure Transmission Demo"
+description = "An interactive educational demo of a UART message pipeline with Hamming error correction and ChaCha20 encryption, including selectable transmission noise and a source-code explorer."
+version = "1.0.0"
+id = "artifacts/secure-transmission-demo"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/secure-transmission-demo/" ]
+localPort = 25217
+
+[services.development]
+run = "pnpm --filter @workspace/secure-transmission-demo run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/secure-transmission-demo", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/secure-transmission-demo/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25217"
+BASE_PATH = "/secure-transmission-demo/"

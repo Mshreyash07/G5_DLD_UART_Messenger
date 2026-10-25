@@ -1,0 +1,1 @@
+- [Secure UART presentation goals](secure-uart-presentation-demo.md) — keep the encryption/error-correction story clear and distinguish the teaching model from the uploaded RTL.
